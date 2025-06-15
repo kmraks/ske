@@ -6,91 +6,18 @@ from datetime import datetime
 import os
 from PIL import Image
 import base64
+import json
+from tabs.recharge_catalogue_tab import show as show_recharge_catalogue
+from tabs.products_tab import show as show_products
+from tabs.about_us import show as show_about_us
+from db import get_connection
 
 # Set page config BEFORE any other Streamlit commands
 st.set_page_config(page_title="Sri Kailash Electronics", layout="wide")
 
 # --- DB Setup ---
-conn = sqlite3.connect("recharge.db", check_same_thread=False)
-c = conn.cursor()
+conn, c = get_connection(db_path="recharge.db")
 
-# Create necessary tables if not exist
-c.execute('''CREATE TABLE IF NOT EXISTS clients (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    phone TEXT UNIQUE,
-    group_name TEXT,
-    operator TEXT,
-    plan_amount REAL,
-    recharge_day INTEGER,
-    premium BOOLEAN DEFAULT 0,
-    notes TEXT,
-    lucky_draw_wins INTEGER DEFAULT 0,
-    referred BOOLEAN DEFAULT 0,
-    referred_by_name TEXT,
-    referred_by_phone TEXT
-)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id INTEGER,
-    amount REAL,
-    discount REAL,
-    commission REAL,
-    status TEXT,
-    created_at TEXT
-)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS ads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    message TEXT,
-    group_name TEXT,
-    created_at TEXT
-)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message TEXT,
-    recipient_group TEXT,
-    sent_at TEXT
-)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    category TEXT,
-    subcategory TEXT,
-    price REAL,
-    stock INTEGER DEFAULT 0,
-    description TEXT,
-    image_path TEXT
-)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS recharge_plans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    data TEXT,
-    voice TEXT,
-    sms TEXT,
-    validity INTEGER,
-    operator TEXT,
-    subcategory TEXT,
-    price REAL,
-    description TEXT,
-    image_path TEXT
-)''')
-
-c.execute('''CREATE TABLE IF NOT EXISTS product_orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER,
-    client_id INTEGER,
-    quantity INTEGER,
-    status TEXT,
-    created_at TEXT
-)''')
-
-conn.commit()
 
 def get_base64(file_path):
     with open(file_path, "rb") as f:
@@ -124,25 +51,43 @@ def set_logo():
     else:
         st.error(f"Logo image not found at {logo_path}")
 
+# Load config
+with open("config.json", "r") as f:
+    config = json.load(f)
+
 # Call the function to set the logo
 set_logo()
 
 # --- Navigation Menu ---
-st.sidebar.title("Sri Kailash Electronics")
-menu = st.sidebar.radio("Navigate", [
+st.title("Sri Kailash Electronics")
+
+tab_names = [
     "Dashboard", "Clients", "Recharge Catalogue", "Recharge Orders",
     "Product Catalogue", "Product Orders", "WhatsApp Ads", "WhatsApp Alerts",
     "Lucky Draw", "About Us"
-])
+]
+tabs = st.tabs(tab_names)
 
-# --- Dashboard ---
-if menu == "Dashboard":
+with tabs[0]:
+    # --- Dashboard ---
     st.title("📊 Dashboard Overview")
     total_clients = pd.read_sql_query("SELECT COUNT(*) as cnt FROM clients", conn).iloc[0]['cnt']
     total_orders = pd.read_sql_query("SELECT COUNT(*) as cnt FROM orders", conn).iloc[0]['cnt']
-    commission_df = pd.read_sql_query("SELECT commission FROM orders WHERE status='Recharged'", conn)
-    total_commission = commission_df['commission'].sum() if not commission_df.empty else 0
-    due_clients = pd.read_sql_query(f"SELECT * FROM clients WHERE recharge_day={datetime.today().day}", conn)
+    
+    # Only sum commission for 'Recharged' orders
+    commission_df = pd.read_sql_query(
+        "SELECT amount, discount FROM orders WHERE status='Recharged'", conn
+    )
+    if not commission_df.empty:
+        commission_df['commission'] = (commission_df['amount'] * 0.05) - commission_df['discount']
+        commission_df['commission'] = commission_df['commission'].clip(lower=0)
+        total_commission = commission_df['commission'].sum()
+    else:
+        total_commission = 0
+
+    due_clients = pd.read_sql_query(
+        f"SELECT * FROM clients WHERE recharge_day={datetime.today().day}", conn
+    )
     due_count = len(due_clients)
     
     col1, col2, col3, col4 = st.columns(4)
@@ -153,9 +98,11 @@ if menu == "Dashboard":
     
     st.markdown("---")
     st.markdown("### Pending Recharge Orders")
-    pending_recharge = pd.read_sql_query("SELECT * FROM orders WHERE status='Pending' ORDER BY created_at DESC", conn)
-    if not pending_recharge.empty:
-        st.dataframe(pending_recharge)
+    pending_orders = pd.read_sql_query("SELECT * FROM orders WHERE status='Pending'", conn)
+    if not pending_orders.empty:
+        pending_orders['commission'] = (pending_orders['amount'] * 0.05) - pending_orders['discount']
+        pending_orders['commission'] = pending_orders['commission'].clip(lower=0)
+        st.dataframe(pending_orders[['id', 'client_id', 'amount', 'discount', 'commission', 'status', 'created_at']])
     else:
         st.info("No pending recharge orders.")
     
@@ -166,8 +113,45 @@ if menu == "Dashboard":
     else:
         st.info("No pending product orders.")
 
-# --- Clients ---
-elif menu == "Clients":
+    # --- Pending Due Recharges ---
+    st.markdown("### Pending Due Recharges")
+
+    today_day = datetime.today().day
+    this_month = datetime.today().strftime("%Y-%m")
+
+    # Get clients whose recharge_day is today
+    due_clients = pd.read_sql_query(
+        f"SELECT * FROM clients WHERE recharge_day={today_day}", conn
+    )
+
+    if not due_clients.empty:
+        # Find clients who do NOT have a 'Recharged' order this month
+        due_clients['has_recharged'] = due_clients['id'].apply(
+            lambda cid: pd.read_sql_query(
+                "SELECT COUNT(*) as cnt FROM orders WHERE client_id=? AND status='Recharged' AND strftime('%Y-%m', created_at)=?",
+                conn, params=(cid, this_month)
+            ).iloc[0]['cnt'] > 0
+        )
+        pending_due = due_clients[~due_clients['has_recharged']]
+        if not pending_due.empty:
+            st.dataframe(
+                pending_due[['id', 'name', 'phone', 'operator', 'plan_amount', 'recharge_day']]
+                .rename(columns={
+                    'id': 'Client ID',
+                    'name': 'Name',
+                    'phone': 'Phone',
+                    'operator': 'Operator',
+                    'plan_amount': 'Plan Amount',
+                    'recharge_day': 'Due Day'
+                })
+            )
+        else:
+            st.info("No pending due recharges for today.")
+    else:
+        st.info("No clients with recharge due today.")
+
+with tabs[1]:
+    # --- Clients ---
     st.title("👥 Clients Management")
     search_term = st.text_input("Search Clients (Name or Phone)")
     if search_term:
@@ -252,7 +236,7 @@ elif menu == "Clients":
                         st.error("Phone number already exists.")
     
     with st.expander("Edit / Delete Client"):
-        edit_client_id = st.number_input("Enter Client ID to Edit/Delete", min_value=1, key="edit_client")
+        edit_client_id = st.number_input("Enter Client ID", key="edit_client_id")
         if st.button("Fetch Client Data", key="fetch_client"):
             edit_client_df = pd.read_sql_query("SELECT * FROM clients WHERE id=?", conn, params=(edit_client_id,))
             if edit_client_df.empty:
@@ -314,113 +298,32 @@ elif menu == "Clients":
         else:
             st.info("Fetch a client to edit or delete.")
 
-# --- Recharge Catalogue ---
-elif menu == "Recharge Catalogue":
-    st.title("📚 Recharge Catalogue")
-    # --- CREATE New Recharge Plan ---
-    with st.expander("Add New Recharge Plan"):
-        with st.form("add_recharge_plan"):
-            rp_name = st.text_input("Plan Name")
-            rp_data = st.text_input("Data (in GB)")
-            rp_voice = st.text_input("Voice (in minutes)")
-            rp_sms = st.text_input("SMS (in messages)")
-            rp_validity = st.number_input("Validity (days)", min_value=1, step=1)
-            rp_operator = st.text_input("Operator")
-            rp_subcat = st.selectbox("Subcategory", ["Prepaid", "Postpaid", "Broadband"])
-            rp_price = st.number_input("Price (₹)", min_value=0.0, step=1.0)
-            rp_desc = st.text_area("Description")
-            rp_image = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"], key="rp_image")
-            rp_submit = st.form_submit_button("Add Recharge Plan")
-            if rp_submit:
-                if not rp_name or not rp_operator or rp_price == 0.0:
-                    st.error("Plan Name, Operator and Price are required.")
-                else:
-                    rp_image_path = ""
-                    if rp_image:
-                        os.makedirs("recharge_plans", exist_ok=True)
-                        rp_image_path = f"recharge_plans/{rp_name.replace(' ', '_').lower()}.{rp_image.type.split('/')[1]}"
-                        with open(rp_image_path, "wb") as f:
-                            f.write(rp_image.getbuffer())
-                    try:
-                        c.execute(
-                            "INSERT INTO recharge_plans (name, data, voice, sms, validity, operator, subcategory, price, description, image_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (rp_name, rp_data, rp_voice, rp_sms, rp_validity, rp_operator, rp_subcat, rp_price, rp_desc, rp_image_path)
-                        )
-                        conn.commit()
-                        st.success("Recharge plan added successfully!")
-                    except Exception as e:
-                        st.error(f"Failed to add recharge plan: {e}")
-    # --- READ Recharge Plans List ---
-    st.markdown("### Recharge Plans List")
-    rp_df = pd.read_sql_query("SELECT * FROM recharge_plans ORDER BY name", conn)
-    if not rp_df.empty:
-        st.dataframe(rp_df)
-    else:
-        st.info("No recharge plans available.")
-    # --- UPDATE / DELETE Recharge Plan ---
-    with st.expander("Edit / Delete Recharge Plan"):
-        rp_id = st.number_input("Enter Recharge Plan ID", min_value=1, step=1, key="rp_id")
-        if st.button("Fetch Recharge Plan", key="fetch_rp"):
-            rp_fetch = pd.read_sql_query("SELECT * FROM recharge_plans WHERE id=?", conn, params=(rp_id,))
-            if rp_fetch.empty:
-                st.error("Recharge plan not found.")
-            else:
-                st.session_state.rp_data = rp_fetch.iloc[0].to_dict()
-                st.success("Recharge plan data fetched!")
-        if "rp_data" in st.session_state:
-            rp_data_dict = st.session_state.rp_data
-            with st.form("update_rp_form"):
-                new_rp_name = st.text_input("Plan Name", value=rp_data_dict["name"])
-                new_rp_data = st.text_input("Data (in GB)", value=rp_data_dict["data"])
-                new_rp_voice = st.text_input("Voice (in minutes)", value=rp_data_dict["voice"])
-                new_rp_sms = st.text_input("SMS (in messages)", value=rp_data_dict["sms"])
-                new_rp_validity = st.number_input("Validity (days)", min_value=1, step=1, value=int(rp_data_dict["validity"]))
-                new_rp_operator = st.text_input("Operator", value=rp_data_dict["operator"])
-                new_rp_subcat = st.text_input("Subcategory", value=rp_data_dict["subcategory"])
-                new_rp_price = st.number_input("Price (₹)", min_value=0.0, step=1.0, value=float(rp_data_dict["price"]))
-                new_rp_desc = st.text_area("Description", value=rp_data_dict["description"])
-                new_rp_image_file = st.file_uploader("Upload New Image (optional)", type=["jpg", "jpeg", "png"], key="new_rp_image")
-                update_rp_submit = st.form_submit_button("Update Recharge Plan")
-                if update_rp_submit:
-                    if new_rp_image_file:
-                        os.makedirs("recharge_plans", exist_ok=True)
-                        new_rp_image_path = f"recharge_plans/{new_rp_name.replace(' ', '_').lower()}.{new_rp_image_file.type.split('/')[1]}"
-                        with open(new_rp_image_path, "wb") as f:
-                            f.write(new_rp_image_file.getbuffer())
-                    else:
-                        new_rp_image_path = rp_data_dict.get("image_path", "")
-                    try:
-                        c.execute("UPDATE recharge_plans SET name=?, data=?, voice=?, sms=?, validity=?, operator=?, subcategory=?, price=?, description=?, image_path=? WHERE id=?",
-                                  (new_rp_name, new_rp_data, new_rp_voice, new_rp_sms, new_rp_validity, new_rp_operator, new_rp_subcat, new_rp_price, new_rp_desc, new_rp_image_path, rp_data_dict["id"]))
-                        conn.commit()
-                        st.success("Recharge plan updated successfully!")
-                        del st.session_state.rp_data
-                    except Exception as e:
-                        st.error(f"Failed to update recharge plan: {e}")
-            st.markdown("### Delete Recharge Plan")
-            confirm_rp_delete = st.checkbox("Check to confirm deletion", key="confirm_rp_delete")
-            if st.button("Delete Recharge Plan", key="delete_rp"):
-                if confirm_rp_delete:
-                    try:
-                        c.execute("DELETE FROM recharge_plans WHERE id=?", (rp_data_dict["id"],))
-                        conn.commit()
-                        st.success("Recharge plan deleted successfully!")
-                        del st.session_state.rp_data
-                    except Exception as e:
-                        st.error(f"Deletion failed: {e}")
-                else:
-                    st.error("Please confirm deletion by checking the checkbox.")
+with tabs[2]:
+    show_recharge_catalogue(conn, c)
+    
 
-# --- Recharge Orders ---
-elif menu == "Recharge Orders":
+with tabs[3]:
+    # --- Recharge Orders ---
     st.title("⚡ Recharge Orders")
     with st.expander("Add New Recharge Order"):
         with st.form("add_recharge_order"):
             client_id = st.number_input("Client ID", min_value=1, step=1)
+            if client_id:
+                client_data = pd.read_sql_query("SELECT name FROM clients WHERE id=?", conn, params=(client_id,))
+                if not client_data.empty:
+                    st.write(f"Client Name: {client_data.iloc[0]['name']}")
+                else:
+                    st.error("Client ID not found.")
+            else:
+                st.error("Please enter a valid Client ID.")
+            
+            
             amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0)
             discount = 0.0
             if amount:
-                discount = round(amount * random.uniform(0.0025, 0.0175), 2)
+                discount_min = config["discount"]["min"]
+                discount_max = config["discount"]["max"]
+                discount = round(amount * random.uniform(discount_min, discount_max), 2)
             st.number_input("Discount (%)", value=discount, disabled=True, step=0.01)
             status = st.selectbox("Status", ["Pending", "Recharged", "Failed"])
             created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -436,7 +339,9 @@ elif menu == "Recharge Orders":
     st.markdown("### Recharge Orders List")
     orders_df = pd.read_sql_query("SELECT * FROM orders ORDER BY created_at DESC", conn)
     if not orders_df.empty:
-        st.dataframe(orders_df)
+        orders_df['commission'] = (orders_df['amount'] * 0.05) - orders_df['discount']
+        orders_df['commission'] = orders_df['commission'].clip(lower=0)
+        st.dataframe(orders_df[['id', 'client_id', 'amount', 'discount', 'commission', 'status', 'created_at']])
     else:
         st.info("No recharge orders available.")
     with st.expander("Edit / Delete Recharge Order"):
@@ -481,94 +386,11 @@ elif menu == "Recharge Orders":
                 else:
                     st.error("Please confirm deletion.")
 
-# --- Product Catalogue ---
-elif menu == "Product Catalogue":
-    st.title("🛍️ Product Catalogue")
-    with st.expander("Add New Product"):
-        with st.form("add_product"):
-            prod_name = st.text_input("Product Name")
-            prod_category = st.selectbox("Category", ["Mobiles", "Accessories", "Others"])
-            prod_subcat = st.selectbox("Subcategory", ["Mobiles", "Accessories", "Others"])
-            prod_price = st.number_input("Price (₹)", min_value=0.0, step=1.0)
-            prod_desc = st.text_area("Description")
-            prod_image = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"], key="prod_image")
-            add_prod = st.form_submit_button("Add Product")
-            if add_prod:
-                if not prod_name or not prod_category or prod_price == 0.0:
-                    st.error("Product Name, Category and Price are required.")
-                else:
-                    prod_image_path = ""
-                    if prod_image:
-                        os.makedirs("products", exist_ok=True)
-                        prod_image_path = f"products/{prod_name.replace(' ', '_').lower()}.{prod_image.type.split('/')[1]}"
-                        with open(prod_image_path, "wb") as f:
-                            f.write(prod_image.getbuffer())
-                    try:
-                        c.execute("INSERT INTO products (name, category, subcategory, price, description, image_path) VALUES (?, ?, ?, ?, ?, ?)",
-                                  (prod_name, prod_category, prod_subcat, prod_price, prod_desc, prod_image_path))
-                        conn.commit()
-                        st.success("Product added successfully!")
-                    except Exception as e:
-                        st.error("Failed to add product: " + str(e))
-    st.markdown("### Products List")
-    prod_df = pd.read_sql_query("SELECT * FROM products ORDER BY name", conn)
-    if not prod_df.empty:
-        st.dataframe(prod_df)
-    else:
-        st.info("No products available.")
-    with st.expander("Edit / Delete Product"):
-        prod_id = st.number_input("Enter Product ID", min_value=1, key="prod_id")
-        if st.button("Fetch Product Data", key="fetch_prod"):
-            prod_fetch = pd.read_sql_query("SELECT * FROM products WHERE id=?", conn, params=(prod_id,))
-            if prod_fetch.empty:
-                st.error("Product not found.")
-            else:
-                st.session_state.prod_data = prod_fetch.iloc[0].to_dict()
-                st.success("Product data fetched!")
-        if "prod_data" in st.session_state:
-            prod_data_dict = st.session_state.prod_data
-            with st.form("update_prod_form"):
-                new_prod_name = st.text_input("Product Name", value=prod_data_dict["name"])
-                new_prod_category = st.selectbox("Category", ["Mobiles", "Accessories", "Others"],
-                                                 index=["Mobiles", "Accessories", "Others"].index(prod_data_dict["category"]) if prod_data_dict["category"] in ["Mobiles", "Accessories", "Others"] else 0)
-                new_prod_subcat = st.selectbox("Subcategory", ["Mobiles", "Accessories", "Others"],
-                                               index=["Mobiles", "Accessories", "Others"].index(prod_data_dict.get("subcategory", "Mobiles")))
-                new_prod_price = st.number_input("Price (₹)", min_value=0.0, step=1.0, value=float(prod_data_dict["price"]))
-                new_prod_desc = st.text_area("Description", value=prod_data_dict["description"])
-                new_prod_image = st.file_uploader("Upload New Image (optional)", type=["jpg", "jpeg", "png"], key="new_prod_image")
-                update_prod = st.form_submit_button("Update Product")
-                if update_prod:
-                    if new_prod_image:
-                        os.makedirs("products", exist_ok=True)
-                        new_prod_image_path = f"products/{new_prod_name.replace(' ', '_').lower()}.{new_prod_image.type.split('/')[1]}"
-                        with open(new_prod_image_path, "wb") as f:
-                            f.write(new_prod_image.getbuffer())
-                    else:
-                        new_prod_image_path = prod_data_dict.get("image_path", "")
-                    try:
-                        c.execute("UPDATE products SET name=?, category=?, subcategory=?, price=?, description=?, image_path=? WHERE id=?",
-                                  (new_prod_name, new_prod_category, new_prod_subcat, new_prod_price, new_prod_desc, new_prod_image_path, prod_data_dict["id"]))
-                        conn.commit()
-                        st.success("Product updated successfully!")
-                        del st.session_state.prod_data
-                    except Exception as e:
-                        st.error("Update failed: " + str(e))
-            st.markdown("### Delete Product")
-            confirm_prod_del = st.checkbox("Confirm deletion", key="confirm_prod_del")
-            if st.button("Delete Product", key="delete_prod"):
-                if confirm_prod_del:
-                    try:
-                        c.execute("DELETE FROM products WHERE id=?", (prod_data_dict["id"],))
-                        conn.commit()
-                        st.success("Product deleted successfully!")
-                        del st.session_state.prod_data
-                    except Exception as e:
-                        st.error("Deletion failed: " + str(e))
-                else:
-                    st.error("Please confirm deletion by checking the box.")
+with tabs[4]:
+   show_products(conn, c)
 
-# --- Product Orders ---
-elif menu == "Product Orders":
+with tabs[5]:
+    # --- Product Orders ---
     st.title("📦 Product Orders")
     with st.expander("Add New Product Order"):
         with st.form("add_product_order"):
@@ -633,8 +455,8 @@ elif menu == "Product Orders":
                 else:
                     st.error("Please confirm deletion by checking the box.")
 
-# --- WhatsApp Ads ---
-elif menu == "WhatsApp Ads":
+with tabs[6]:
+    # --- WhatsApp Ads ---
     st.title("📢 WhatsApp Ads")
     with st.form("send_ads"):
         title = st.text_input("Ad Title")
@@ -647,8 +469,8 @@ elif menu == "WhatsApp Ads":
             conn.commit()
             st.success("Ad saved and queued for sending.")
 
-# --- WhatsApp Alerts ---
-elif menu == "WhatsApp Alerts":
+with tabs[7]:
+    # --- WhatsApp Alerts ---
     st.title("📲 WhatsApp Alerts")
     with st.form("send_alerts"):
         alert_message = st.text_area("Alert Message")
@@ -660,8 +482,8 @@ elif menu == "WhatsApp Alerts":
             conn.commit()
             st.success("Alert saved and queued for sending.")
 
-# --- Lucky Draw ---
-elif menu == "Lucky Draw":
+with tabs[8]:
+    # --- Lucky Draw ---
     st.title("🎉 Lucky Draw")
     clients_df = pd.read_sql_query("SELECT id, name, phone, lucky_draw_wins FROM clients", conn)
     if st.button("Pick a Lucky Winner!"):
@@ -675,34 +497,9 @@ elif menu == "Lucky Draw":
     st.markdown("#### Lucky Draw Winners Count")
     st.dataframe(clients_df[["name", "phone", "lucky_draw_wins"]])
 
-# --- About Us ---
-elif menu == "About Us":
-    st.header("📄 About Us – Sri Kailash Electronics")
-    st.markdown("""
-**Engineered for Service. Trusted Since 1991.**
-
-Welcome to **Sri Kailash Electronics**, your trusted destination for mobile recharges, electronics, and smart connectivity. We blend tradition with modern tech to serve our community with quality service.
-
----
-### Our Journey
-Founded in **1991**, we started with repair and sales of radios, televisions and household electronics, evolving into a hub for mobile technology.
-
----
-### Today's Offerings
-- Mobile recharges & circuit repairs  
-- Sales of mobile phones & accessories  
-- Broadband, SIM card services & connectivity  
-- WhatsApp alerts, Lucky Draws, and loyalty programs
-
----
-### Our Mission
-To combine old-school trust with modern technology and deliver exceptional service.
-
-**Visit Us:**  
-Sri Kailash Electronics, Manpur, Gaya – Bihar  
-📞 [Your Contact Number]  
-🕒 Mon–Sat | 9 AM – 8 PM
-    """)
+with tabs[9]:
+    # --- About Us ---
+    show_about_us()
 
 
 def set_black_background():
@@ -745,6 +542,51 @@ def set_fixed_svg_with_black_background(svg_path):
 
 # Call the function to set the fixed SVG background with black base
 set_fixed_svg_with_black_background("ske.svg")
+
+def calculate_commission(amount, discount):
+    commission = (amount * 0.05) - discount
+    return max(commission, 0)  # Ensure commission is not negative
+
+# Example: When adding a new recharge order
+def add_recharge_order(client_id, amount, discount, status="Pending"):
+    commission = calculate_commission(amount, discount)
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "INSERT INTO orders (client_id, amount, discount, commission, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (client_id, amount, discount, commission, status, created_at)
+    )
+    conn.commit()
+
+# Example: When updating an existing recharge order
+def update_recharge_order(order_id, amount, discount, status):
+    commission = calculate_commission(amount, discount)
+    c.execute(
+        "UPDATE orders SET amount=?, discount=?, commission=?, status=? WHERE id=?",
+        (amount, discount, commission, status, order_id)
+    )
+    conn.commit()
+
+# Run this ONCE to migrate your table, then remove/comment it out
+c.execute("""
+    CREATE TABLE IF NOT EXISTS recharge_plans_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        data TEXT,
+        voice TEXT,
+        sms TEXT,
+        validity INTEGER,
+        operator TEXT,
+        price REAL,
+        description TEXT
+    )
+""")
+c.execute("""
+    INSERT INTO recharge_plans_new (id, name, data, voice, sms, validity, operator, price, description)
+    SELECT id, name, data, voice, sms, validity, operator, price, description FROM recharge_plans
+""")
+c.execute("DROP TABLE recharge_plans")
+c.execute("ALTER TABLE recharge_plans_new RENAME TO recharge_plans")
+conn.commit()
 
 
 
