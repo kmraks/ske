@@ -55,6 +55,25 @@ def set_logo():
 with open("config.json", "r") as f:
     config = json.load(f)
 
+# --- Load password from config.json ---
+APP_PASSWORD = config.get("app_password", "")
+
+# --- Simple Login Page ---
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    st.title("Login")
+    password = st.text_input("Enter password", type="password")
+    if st.button("Login"):
+        if password == APP_PASSWORD:
+            st.session_state.logged_in = True
+            st.success("Login successful!")
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
 # Call the function to set the logo
 set_logo()
 
